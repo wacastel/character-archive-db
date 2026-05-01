@@ -120,7 +120,7 @@ To support a community of roughly 500 patrons and an archive of over 3,000 high-
 
 ---
 
-## Appendix: Patreon OAuth Flow Implementation
+## Appendix A: Patreon OAuth Flow Implementation
 
 Because Supabase does not have a native Patreon authentication provider, we use a custom OAuth bridge between the Angular frontend and a Supabase Edge Function.
 
@@ -263,6 +263,148 @@ export class AuthCallbackComponent implements OnInit {
         
         console.log("Successfully verified Patreon status!");
         this.router.navigate(['/archive']); // Redirect to the protected gallery
+      }
+    });
+  }
+}
+```
+---
+
+## Appendix B: Secure Session Establishment
+
+To prevent malicious users from spoofing a Patreon ID in the URL, we must securely hand off the session from the Edge Function to the Angular frontend. We achieve this by utilizing Patreon's email scope and the Supabase Admin `generateLink` API.
+
+### Step 1: Request Email Scope in Angular
+Update the Patreon authorization URL in the Angular app to request the user's email address.
+
+```typescript
+// auth.service.ts
+loginWithPatreon() {
+  const clientId = 'YOUR_PATREON_CLIENT_ID';
+  const redirectUri = encodeURIComponent('https://[YOUR_SUPABASE_REF].supabase.co/functions/v1/patreon-auth');
+  
+  // ADDED 'identity[email]' to the scopes
+  const patreonAuthUrl = `https://www.patreon.com/oauth2/authorize?response_type=code&client_id=${clientId}&redirect_uri=${redirectUri}&scope=identity identity[email] identity[memberships]`;
+
+  window.location.href = patreonAuthUrl;
+}
+```
+
+### Step 2: The Secure Edge Function
+Update the Edge Function to fetch the email, ensure the user exists in Supabase Auth, generate a secure token link, and redirect the user using that link.
+
+```typescript
+// supabase/functions/patreon-auth/index.ts
+import { serve } from "[https://deno.land/std@0.168.0/http/server.ts](https://deno.land/std@0.168.0/http/server.ts)";
+import { createClient } from "[https://esm.sh/@supabase/supabase-js@2](https://esm.sh/@supabase/supabase-js@2)";
+
+const PATREON_CLIENT_ID = Deno.env.get('PATREON_CLIENT_ID')!;
+const PATREON_CLIENT_SECRET = Deno.env.get('PATREON_CLIENT_SECRET')!;
+const TARGET_CAMPAIGN_ID = Deno.env.get('TARGET_CAMPAIGN_ID')!;
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+
+serve(async (req) => {
+  const url = new URL(req.url);
+  const code = url.searchParams.get('code');
+
+  if (!code) return new Response("Missing code", { status: 400 });
+
+  try {
+    // 1. Exchange code for Patreon Token
+    const tokenResponse = await fetch('[https://www.patreon.com/api/oauth2/token](https://www.patreon.com/api/oauth2/token)', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        grant_type: 'authorization_code',
+        client_id: PATREON_CLIENT_ID,
+        client_secret: PATREON_CLIENT_SECRET,
+        redirect_uri: 'https://[YOUR_SUPABASE_REF].supabase.co/functions/v1/patreon-auth',
+      }),
+    });
+    const { access_token } = await tokenResponse.json();
+
+    // 2. Fetch Identity + Email + Memberships
+    // Note the added fields[user]=email parameter
+    const userResponse = await fetch('[https://www.patreon.com/api/oauth2/v2/identity?include=memberships.campaign&fields](https://www.patreon.com/api/oauth2/v2/identity?include=memberships.campaign&fields)[user]=email&fields[member]=patron_status', {
+      headers: { Authorization: `Bearer ${access_token}` },
+    });
+    const userData = await userResponse.json();
+    const email = userData.data.attributes.email;
+    const patreonId = userData.data.id;
+
+    // 3. Verify Active Patron Status
+    const memberships = userData.included?.filter((item: any) => item.type === 'member') || [];
+    const isActivePatron = memberships.some((member: any) => 
+      member.relationships.campaign.data.id === TARGET_CAMPAIGN_ID &&
+      member.attributes.patron_status === 'active_patron'
+    );
+
+    if (!isActivePatron) {
+      return Response.redirect('[https://your-angular-app.com/login?error=not_a_patron](https://your-angular-app.com/login?error=not_a_patron)', 302);
+    }
+
+    // 4. Connect to Supabase Admin
+    const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false }
+    });
+
+    // 5. Upsert the User in Supabase Auth
+    // We try to create them. If they already exist, this returns an error, which is fine to ignore.
+    await supabaseAdmin.auth.admin.createUser({
+      email: email,
+      email_confirm: true,
+      user_metadata: { patreon_id: patreonId }
+    });
+
+    // 6. Generate a secure, one-time authentication link
+    const { data: linkData, error: linkError } = await supabaseAdmin.auth.admin.generateLink({
+      type: 'magiclink',
+      email: email,
+      options: {
+        // This is where they will land in the Angular app after logging in
+        redirectTo: '[https://your-angular-app.com/archive](https://your-angular-app.com/archive)' 
+      }
+    });
+
+    if (linkError) throw linkError;
+
+    // 7. Redirect the browser directly to the generated secure URL
+    // The URL will look like: https://[ref].supabase.co/auth/v1/verify?token=xxx&type=magiclink...
+    return Response.redirect(linkData.properties.action_link, 302);
+
+  } catch (error) {
+    console.error(error);
+    return new Response("Authentication failed", { status: 500 });
+  }
+});
+```
+
+### Step 3: Handling the Redirect in Angular
+Because the Edge Function redirects the user to a Supabase-generated verification link, the user will automatically land on your `redirectTo` URL (e.g., `/archive`). 
+
+The standard `@supabase/supabase-js` client library running in your Angular application will automatically detect the access tokens in the URL fragment, establish the local session, and strip the tokens from the URL for security.
+
+You simply need to listen for auth state changes in your Angular Auth Service:
+
+```typescript
+// auth.service.ts
+import { Injectable } from '@angular/core';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+
+@Injectable({ providedIn: 'root' })
+export class AuthService {
+  private supabase: SupabaseClient;
+
+  constructor() {
+    this.supabase = createClient('YOUR_SUPABASE_URL', 'YOUR_SUPABASE_ANON_KEY');
+
+    // This listener automatically fires when the user lands on the page 
+    // after the Edge Function redirect.
+    this.supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'SIGNED_IN') {
+        console.log('User is securely logged in!', session?.user);
       }
     });
   }
