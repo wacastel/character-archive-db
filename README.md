@@ -117,3 +117,154 @@ To support a community of roughly 500 patrons and an archive of over 3,000 high-
 
 * **Frontend Hosting (Angular):** Cloudflare Pages or Vercel. Both offer generous free tiers with excellent global CDN performance. Cloudflare Pages is highly recommended due to unmetered bandwidth on the free tier.
 * **Backend Hosting (Supabase):** The **Supabase Pro Tier ($25/month)**. While a free tier exists, it is limited to 1GB of storage. The Pro tier provides 100GB of storage and 50GB of bandwidth, which will comfortably accommodate the total collection of Accessverse artwork and scale as new characters are added.
+
+---
+
+## Appendix: Patreon OAuth Flow Implementation
+
+Because Supabase does not have a native Patreon authentication provider, we use a custom OAuth bridge between the Angular frontend and a Supabase Edge Function.
+
+### The Big Picture: How the Flow Works
+1. **The Jump:** A user clicks "Login" on the Angular site. The site sends them directly to Patreon's authorization page.
+2. **The Handshake:** The user approves the app. Patreon sends them to the Supabase Edge Function, carrying a temporary secret "code."
+3. **The Verification:** The Edge Function asks Patreon for the user's identity and membership status.
+4. **The VIP Pass:** If they are an active patron of the target campaign, the Edge Function logs them in and sends them back to the Angular site.
+5. **The Entry:** Angular establishes the session, allowing the user to view the archive.
+
+---
+
+### Step 1: The Angular Frontend (Initiating the Login)
+First, register an app on the [Patreon Developer Portal](https://www.patreon.com/portal/registration/register-clients) to obtain a `Client ID`.
+
+In your Angular component, trigger the redirect when the login button is clicked:
+
+```typescript
+// auth.service.ts or login.component.ts
+
+loginWithPatreon() {
+  const clientId = 'YOUR_PATREON_CLIENT_ID';
+  
+  // This MUST exactly match the redirect URI set in the Patreon Developer portal.
+  // It points to your Supabase Edge Function URL.
+  const redirectUri = encodeURIComponent('https://[YOUR_SUPABASE_REF].supabase.co/functions/v1/patreon-auth');
+  
+  // The scopes request basic identity and membership data
+  const patreonAuthUrl = `https://www.patreon.com/oauth2/authorize?response_type=code&client_id=${clientId}&redirect_uri=${redirectUri}&scope=identity identity[memberships]`;
+
+  // Redirect the user to Patreon
+  window.location.href = patreonAuthUrl;
+}
+```
+
+---
+
+### Step 2: The Supabase Edge Function (The Backend Brain)
+This serverless function acts as the secure intermediary. It requires three environment variables stored in Supabase: `PATREON_CLIENT_ID`, `PATREON_CLIENT_SECRET`, and `TARGET_CAMPAIGN_ID` (Access's specific Patreon campaign ID).
+
+```typescript
+// supabase/functions/patreon-auth/index.ts
+import { serve } from "[https://deno.land/std@0.168.0/http/server.ts](https://deno.land/std@0.168.0/http/server.ts)";
+import { createClient } from "[https://esm.sh/@supabase/supabase-js@2](https://esm.sh/@supabase/supabase-js@2)";
+
+const PATREON_CLIENT_ID = Deno.env.get('PATREON_CLIENT_ID')!;
+const PATREON_CLIENT_SECRET = Deno.env.get('PATREON_CLIENT_SECRET')!;
+const TARGET_CAMPAIGN_ID = Deno.env.get('TARGET_CAMPAIGN_ID')!;
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!; // Admin bypass key
+
+serve(async (req) => {
+  const url = new URL(req.url);
+  const code = url.searchParams.get('code');
+
+  if (!code) {
+    return new Response("Missing Patreon code", { status: 400 });
+  }
+
+  try {
+    // 1. Exchange the code for a Patreon Access Token
+    const tokenResponse = await fetch('[https://www.patreon.com/api/oauth2/token](https://www.patreon.com/api/oauth2/token)', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        grant_type: 'authorization_code',
+        client_id: PATREON_CLIENT_ID,
+        client_secret: PATREON_CLIENT_SECRET,
+        redirect_uri: 'https://[YOUR_SUPABASE_REF].supabase.co/functions/v1/patreon-auth',
+      }),
+    });
+    
+    const tokenData = await tokenResponse.json();
+    const patreonAccessToken = tokenData.access_token;
+
+    // 2. Fetch the user's identity and their memberships
+    const userResponse = await fetch('[https://www.patreon.com/api/oauth2/v2/identity?include=memberships.campaign&fields](https://www.patreon.com/api/oauth2/v2/identity?include=memberships.campaign&fields)[member]=patron_status', {
+      headers: { Authorization: `Bearer ${patreonAccessToken}` },
+    });
+    const userData = await userResponse.json();
+
+    // 3. Check if they are an active patron of the specific campaign
+    const memberships = userData.included?.filter((item: any) => item.type === 'member') || [];
+    const isActivePatron = memberships.some((member: any) => 
+      member.relationships.campaign.data.id === TARGET_CAMPAIGN_ID &&
+      member.attributes.patron_status === 'active_patron'
+    );
+
+    if (!isActivePatron) {
+      // Redirect them back to the Angular app with an error
+      return Response.redirect('[https://your-angular-app.com/login?error=not_a_patron](https://your-angular-app.com/login?error=not_a_patron)', 302);
+    }
+
+    // 4. They are a patron! Log them into Supabase.
+    // Initialize the Supabase admin client to bypass RLS
+    const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+    const patreonUserId = userData.data.id;
+
+    // Redirect back to the Angular app with a success flag and their Patreon ID (or session token)
+    // Note: For a production app, exchange this securely (e.g., via a secure HttpOnly cookie or an OTP link).
+    return Response.redirect(`https://your-angular-app.com/auth-callback?patreon_id=${patreonUserId}`, 302);
+
+  } catch (error) {
+    return new Response("Authentication failed", { status: 500 });
+  }
+});
+```
+
+---
+
+### Step 3: Back to Angular (Logging In)
+Create a route in the Angular app (e.g., `/auth-callback`) to handle the incoming redirect from the Edge Function.
+
+```typescript
+// auth-callback.component.ts
+import { Component, OnInit } from '@angular/core';
+import { ActivatedRoute, Router } from '@angular/router';
+
+@Component({
+  template: `<p>Verifying Patreon status...</p>`
+})
+export class AuthCallbackComponent implements OnInit {
+  constructor(
+    private route: ActivatedRoute, 
+    private router: Router
+  ) {}
+
+  async ngOnInit() {
+    this.route.queryParams.subscribe(async params => {
+      if (params['error'] === 'not_a_patron') {
+        alert("You must be an active patron to view the archive.");
+        this.router.navigate(['/login']);
+        return;
+      }
+
+      if (params['patreon_id']) {
+        // Complete the Supabase login process using the credentials 
+        // provided by the Edge Function to establish the local session.
+        
+        console.log("Successfully verified Patreon status!");
+        this.router.navigate(['/archive']); // Redirect to the protected gallery
+      }
+    });
+  }
+}
+```
